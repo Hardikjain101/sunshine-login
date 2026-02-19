@@ -22,6 +22,7 @@ import calendar
 import warnings
 import os
 import shutil
+import re
 from functools import lru_cache
 import bcrypt
 import mysql.connector
@@ -62,6 +63,8 @@ EMPLOYEE_DIRECTORY = [
 
 USER_TABLE = "users"
 ACCESS_TABLE = "user_employee_access"
+ANNOTATION_TABLE = "attendance_annotations"
+ANNOTATION_TYPES = ("Open Late", "Early Close", "Special Hours", "Full Off")
 
 
 def _load_db_config() -> dict:
@@ -137,6 +140,244 @@ def _ensure_access_table() -> None:
             cursor.close()
         if conn is not None:
             conn.close()
+
+
+def _normalize_annotation_type(value: str) -> Optional[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    if raw.lower() == "closed":
+        return "Full Off"
+    for allowed in ANNOTATION_TYPES:
+        if raw.lower() == allowed.lower():
+            return allowed
+    return None
+
+
+def _ensure_annotation_table() -> None:
+    """
+    Create annotation table if it does not exist.
+    One annotation is stored per calendar date (UNIQUE date).
+    """
+    conn = None
+    cursor = None
+    try:
+        conn = _get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {ANNOTATION_TABLE} (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                `date` DATE NOT NULL,
+                annotation_type ENUM('Open Late', 'Early Close', 'Special Hours', 'Full Off') NOT NULL,
+                reason TEXT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE KEY uq_annotation_date (`date`)
+            )
+            """
+        )
+        conn.commit()
+    except Exception:
+        # Annotation persistence must remain optional-safe if DB access is limited.
+        pass
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
+
+
+@st.cache_data(show_spinner=False)
+def load_annotations_from_db() -> Tuple[Tuple[str, str, str], ...]:
+    """
+    Fetch all persisted annotations.
+    Returns tuple rows: (YYYY-MM-DD, annotation_type, reason)
+    """
+    conn = None
+    cursor = None
+    rows: List[Tuple[str, str, str]] = []
+    try:
+        _ensure_annotation_table()
+        conn = _get_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            f"""
+            SELECT `date`, annotation_type, reason
+            FROM {ANNOTATION_TABLE}
+            ORDER BY `date`
+            """
+        )
+        for row in (cursor.fetchall() or []):
+            raw_date = row.get("date")
+            if pd.isna(raw_date):
+                continue
+            if isinstance(raw_date, datetime):
+                date_str = raw_date.date().strftime("%Y-%m-%d")
+            elif isinstance(raw_date, date):
+                date_str = raw_date.strftime("%Y-%m-%d")
+            else:
+                date_str = str(raw_date)
+            ann_type = _normalize_annotation_type(row.get("annotation_type")) or "Special Hours"
+            reason = str(row.get("reason") or "").strip()
+            rows.append((date_str, ann_type, reason))
+    except Exception:
+        return tuple()
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
+    return tuple(rows)
+
+
+def upsert_annotation(annotation_date: date, annotation_type: str, reason: str = "") -> bool:
+    """
+    Insert or update a date annotation (one row per date).
+    """
+    normalized_type = _normalize_annotation_type(annotation_type)
+    if annotation_date is None or not normalized_type:
+        return False
+
+    conn = None
+    cursor = None
+    try:
+        _ensure_annotation_table()
+        conn = _get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            INSERT INTO {ANNOTATION_TABLE} (`date`, annotation_type, reason)
+            VALUES (%s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                annotation_type = VALUES(annotation_type),
+                reason = VALUES(reason),
+                created_at = CURRENT_TIMESTAMP
+            """,
+            (annotation_date, normalized_type, str(reason or "").strip()),
+        )
+        conn.commit()
+        load_annotations_from_db.clear()
+        return True
+    except Exception:
+        return False
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
+
+
+def delete_annotation(annotation_date: date) -> bool:
+    """
+    Delete an annotation by date.
+    """
+    if annotation_date is None:
+        return False
+    conn = None
+    cursor = None
+    try:
+        _ensure_annotation_table()
+        conn = _get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            f"DELETE FROM {ANNOTATION_TABLE} WHERE `date` = %s",
+            (annotation_date,),
+        )
+        conn.commit()
+        load_annotations_from_db.clear()
+        return True
+    except Exception:
+        return False
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
+
+
+def get_annotation_items_from_db() -> Tuple[Tuple[str, str, str], ...]:
+    """
+    Public helper to load persisted annotations.
+    """
+    return load_annotations_from_db()
+
+
+def build_special_day_map(
+    special_day_items: Optional[Tuple[Tuple[str, str, str], ...]]
+) -> Dict[date, Dict[str, str]]:
+    """
+    Convert persisted/UI annotation tuple into a date-keyed mapping.
+    """
+    special_day_map: Dict[date, Dict[str, str]] = {}
+    if not special_day_items:
+        return special_day_map
+
+    for date_str, day_type, reason in special_day_items:
+        try:
+            day_date = datetime.strptime(str(date_str), "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            continue
+        normalized_type = _normalize_annotation_type(day_type)
+        if not normalized_type:
+            continue
+        special_day_map[day_date] = {
+            'type': normalized_type,
+            'reason': str(reason or '').strip()
+        }
+    return special_day_map
+
+
+def _parse_hhmm(text: str) -> Optional[time]:
+    text = str(text or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.strptime(text, "%H:%M")
+        return parsed.time().replace(second=0, microsecond=0)
+    except ValueError:
+        return None
+
+
+def _add_minutes_to_time(base: time, minutes: int) -> time:
+    anchor = datetime.combine(date.today(), base)
+    shifted = anchor + timedelta(minutes=int(minutes))
+    return shifted.time().replace(second=0, microsecond=0)
+
+
+def parse_special_hours_reason(reason: str) -> Tuple[Optional[time], Optional[time], str]:
+    """
+    Parse a reason payload that may start with "HH:MM-HH:MM".
+    Returns: (open_time, close_time, display_reason_without_prefix).
+    """
+    raw = str(reason or "").strip()
+    if not raw:
+        return None, None, ""
+
+    match = re.match(
+        r"^\s*(\d{1,2}:\d{2})\s*(?:-|to)\s*(\d{1,2}:\d{2})(?:\s*[\|\-]\s*(.*))?\s*$",
+        raw,
+        flags=re.IGNORECASE
+    )
+    if not match:
+        return None, None, raw
+
+    open_time = _parse_hhmm(match.group(1))
+    close_time = _parse_hhmm(match.group(2))
+    remaining = (match.group(3) or "").strip()
+    if open_time is None or close_time is None:
+        return None, None, raw
+    return open_time, close_time, remaining
+
+
+def format_special_hours_reason(open_time: time, close_time: time, reason: str = "") -> str:
+    """
+    Persist special-hours as "HH:MM-HH:MM | reason" in reason text.
+    """
+    base = f"{open_time.strftime('%H:%M')}-{close_time.strftime('%H:%M')}"
+    reason_text = str(reason or "").strip()
+    if reason_text:
+        return f"{base} | {reason_text}"
+    return base
 
 
 def authenticate_user(username: str, password: str) -> Tuple[bool, str, Optional[Dict[str, object]]]:
@@ -625,12 +866,12 @@ class Config:
     
     # Persistent Storage
     DATA_FILE_PATH = "attendance_data.xlsx"
-    CACHE_VERSION = "2026-02-07"
+    CACHE_VERSION = "2026-02-19"
     
     # Department Auto-Mapping
     DEPARTMENT_MAPPING = {
         'Keyra': 'ex employees',
-        'Brianna': 'Nurse practitioner',
+        'Brianna': 'ex employees',
         'Candice': 'Counselors',
         'Brenda': 'Mid Office',
         'Megan': 'Front Desk',
@@ -639,12 +880,12 @@ class Config:
         'Brittany': 'Mid Office',
         'Dasha': 'Front Desk',
         'Mhykeisha': 'Nurse practitioner',
-        'Alexandra': 'Medical Assistants',
-        'Bethany': 'Medical Assistants',
+        'Alexandra': 'Front Desk',
+        'Bethany': 'Mid Office',
         'Kenyelle': 'Mid Office',
         'Jasmine': 'Mid Office',
         'Courtney': 'ex employees',
-        'Jazmine': 'Mid Office',
+        'Jazmine': 'ex employees',
         'Breanne': 'Nurse practitioner',
         'Stacey': 'Nurse practitioner',
         'Allison': 'Nurse practitioner',
@@ -671,6 +912,7 @@ class Config:
     MIN_WORK_HOURS = 4.0                   # Minimum daily hours
     MAX_WORK_HOURS = 10.0                  # Maximum reasonable hours
     HALF_DAY_THRESHOLD = 5.0               # Hours for half-day
+    MON_THU_FULL_DAY_THRESHOLD = 6.5       # Mon-Thu only full-day threshold
     FULL_DAY_THRESHOLD = 8.0               # Hours for full-day
 
     # Meal-risk visual thresholds (calendar cues only)
@@ -692,8 +934,10 @@ class Config:
 
     # Full-name department overrides (more specific than first-name mapping)
     FULL_NAME_DEPARTMENT_MAPPING = {
-        'Alexandra Daigle': 'Medical Assistants',
-        'Bethany Green': 'Medical Assistants'
+        'Alexandra Daigle': 'Front Desk',
+        'Bethany Green': 'Mid Office',
+        'Jazmine Parfait': 'ex employees',
+        'Brianna Alfred': 'ex employees'
     }
 
     # Punch cleaning / meal sanity guards
@@ -771,6 +1015,21 @@ def get_holiday_map(year: int) -> Dict[date, str]:
     """Deterministic holiday lookup for a given year (cache-safe wrapper)."""
     return get_company_holidays(year)
 
+
+def get_effective_holiday_map(
+    year: int,
+    special_day_items: Optional[Tuple[Tuple[str, str, str], ...]] = None
+) -> Dict[date, str]:
+    """
+    Holiday map extended with persisted Full Off annotations.
+    """
+    holiday_map = get_holiday_map(year).copy()
+    special_day_map = build_special_day_map(special_day_items)
+    for day_date, meta in special_day_map.items():
+        if day_date.year == year and meta.get('type') == 'Full Off':
+            holiday_map[day_date] = "Full Off"
+    return holiday_map
+
 def get_company_holiday_set(start_date: date, end_date: date) -> set:
     """Return a set of holiday dates across a date range (inclusive)."""
     if end_date < start_date:
@@ -794,14 +1053,15 @@ class DataCleaner:
             df['Department'] = np.nan
             
         def get_dept(row):
-            curr = row.get('Department')
-            if pd.notna(curr) and str(curr).strip() not in ['', 'nan', 'None', 'Unknown']:
-                return curr
+            # Specific full-name overrides take precedence over imported values.
             full_name = str(row.get('Employee Full Name', '')).strip().title()
             if full_name:
                 mapped_full = Config.FULL_NAME_DEPARTMENT_MAPPING.get(full_name)
                 if mapped_full:
                     return mapped_full
+            curr = row.get('Department')
+            if pd.notna(curr) and str(curr).strip() not in ['', 'nan', 'None', 'Unknown']:
+                return curr
             fname = str(row.get('Employee First Name', '')).strip().title()
             return Config.DEPARTMENT_MAPPING.get(fname, 'Unknown')
             
@@ -1371,8 +1631,14 @@ class FeatureEngineer:
                     shift_type = 'Full Day'
                 else:
                     shift_type = 'Short Shift' # Or could be another category if needed
+            elif day_of_week in {'Monday', 'Tuesday', 'Wednesday', 'Thursday'}:
+                # Monday-Thursday full-day threshold override
+                if working_hours >= Config.MON_THU_FULL_DAY_THRESHOLD:
+                    shift_type = 'Full Day'
+                elif working_hours >= Config.HALF_DAY_THRESHOLD:
+                    shift_type = 'Half Day'
             else:
-                # Standard weekday logic
+                # Preserve legacy threshold behavior for all other days.
                 if working_hours >= Config.FULL_DAY_THRESHOLD:
                     shift_type = 'Full Day'
                 elif working_hours >= Config.HALF_DAY_THRESHOLD:
@@ -1498,8 +1764,11 @@ class FeatureEngineer:
         weekly_df = daily_df.copy()
         weekly_df['Week'] = weekly_df['Date'].dt.isocalendar().week
         weekly_df['Year'] = weekly_df['Date'].dt.year
-        
-        weekly_hours = weekly_df.groupby(['Employee Full Name', 'Year', 'Week'])['Working Hours'].sum().reset_index()
+
+        overtime_hours_col = 'Overtime Eligible Hours' if 'Overtime Eligible Hours' in weekly_df.columns else 'Working Hours'
+        weekly_hours = weekly_df.groupby(['Employee Full Name', 'Year', 'Week'])[overtime_hours_col].sum().reset_index()
+        if overtime_hours_col != 'Working Hours':
+            weekly_hours = weekly_hours.rename(columns={overtime_hours_col: 'Working Hours'})
         weekly_hours['Expected Hours'] = Config.WEEKLY_STANDARD_HOURS
         weekly_hours['Weekly Overtime'] = weekly_hours['Working Hours'] - Config.WEEKLY_STANDARD_HOURS
         weekly_hours['Weekly Overtime'] = weekly_hours['Weekly Overtime'].clip(lower=0)
@@ -1509,7 +1778,10 @@ class FeatureEngineer:
         monthly_df['Month'] = monthly_df['Date'].dt.month
         monthly_df['Year'] = monthly_df['Date'].dt.year
 
-        monthly_hours = monthly_df.groupby(['Employee Full Name', 'Year', 'Month'])['Working Hours'].sum().reset_index()
+        overtime_hours_col_m = 'Overtime Eligible Hours' if 'Overtime Eligible Hours' in monthly_df.columns else 'Working Hours'
+        monthly_hours = monthly_df.groupby(['Employee Full Name', 'Year', 'Month'])[overtime_hours_col_m].sum().reset_index()
+        if overtime_hours_col_m != 'Working Hours':
+            monthly_hours = monthly_hours.rename(columns={overtime_hours_col_m: 'Working Hours'})
         monthly_hours['Expected Hours'] = Config.MONTHLY_STANDARD_HOURS
         monthly_hours['Monthly Overtime'] = monthly_hours['Working Hours'] - Config.MONTHLY_STANDARD_HOURS
         monthly_hours['Monthly Overtime'] = monthly_hours['Monthly Overtime'].clip(lower=0)
@@ -1563,7 +1835,10 @@ def calculate_15_day_overtime(
         if span_df.empty:
             continue
 
-        actual_hours = span_df.groupby('Employee Full Name')['Working Hours'].sum().reset_index()
+        overtime_hours_col = 'Overtime Eligible Hours' if 'Overtime Eligible Hours' in span_df.columns else 'Working Hours'
+        actual_hours = span_df.groupby('Employee Full Name')[overtime_hours_col].sum().reset_index()
+        if overtime_hours_col != 'Working Hours':
+            actual_hours = actual_hours.rename(columns={overtime_hours_col: 'Working Hours'})
         if actual_hours.empty:
             continue
 
@@ -1813,6 +2088,76 @@ def _clear_all_caches() -> None:
     st.cache_data.clear()
     st.cache_resource.clear()
 
+def _clear_mysql_temp_loaded_data() -> None:
+    """
+    Best-effort cleanup for attendance staging/temp tables, if they exist.
+    """
+    conn = None
+    cursor = None
+    try:
+        db_name = (_load_db_config() or {}).get("database")
+        if not db_name:
+            return
+
+        conn = _get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = %s
+              AND (
+                    table_name LIKE 'tmp_attendance%%'
+                    OR table_name LIKE 'attendance_tmp%%'
+                    OR table_name LIKE 'stg_attendance%%'
+                    OR table_name LIKE 'attendance_staging%%'
+                    OR table_name LIKE '%%attendance%%temp%%'
+                    OR table_name LIKE '%%attendance%%staging%%'
+              )
+            """,
+            (db_name,),
+        )
+        table_names = [row[0] for row in (cursor.fetchall() or []) if row and row[0]]
+        for table_name in table_names:
+            safe_name = str(table_name).replace("`", "")
+            cursor.execute(f"TRUNCATE TABLE `{safe_name}`")
+        conn.commit()
+    except Exception:
+        # Reset must remain safe even when optional temp tables are absent/inaccessible.
+        pass
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
+
+def _reset_dashboard_data_state() -> Tuple[bool, str]:
+    """
+    Clear loaded attendance state and return app to upload-ready condition.
+    Keeps auth context so users remain signed in.
+    """
+    errors: List[str] = []
+
+    _clear_all_caches()
+
+    for path in (Config.DATA_FILE_PATH, _get_backup_path(Config.DATA_FILE_PATH)):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError as ex:
+            errors.append(f"{os.path.basename(path)}: {ex}")
+
+    _clear_mysql_temp_loaded_data()
+
+    if errors:
+        return False, "Reset failed; no partial reset applied. " + " | ".join(errors)
+
+    preserve_keys = {"auth_authenticated", "auth_user", "auth_user_id", "auth_role", "allowed_employees"}
+    for key in list(st.session_state.keys()):
+        if key not in preserve_keys:
+            st.session_state.pop(key, None)
+    return True, "Data reset complete. Dashboard is ready for a fresh upload."
+
 def _is_cache_corruption_error(message: str) -> bool:
     """Detect known cache corruption/decompression signatures."""
     text = str(message or "").lower()
@@ -1951,14 +2296,22 @@ def get_recent_changes(monthly_df: pd.DataFrame) -> pd.DataFrame:
     return recent_changes
 
 def get_work_pattern_kpis_cached(
-    daily_df: pd.DataFrame, employee_name: str, year: int, month: int
+    daily_df: pd.DataFrame,
+    employee_name: str,
+    year: int,
+    month: int,
+    special_day_items: Optional[Tuple[Tuple[str, str, str], ...]] = None
 ) -> Dict[str, float]:
-    return calculate_work_pattern_kpis(daily_df, employee_name, year, month)
+    return calculate_work_pattern_kpis(daily_df, employee_name, year, month, special_day_items)
 
 def get_work_pattern_distribution_cached(
-    daily_df: pd.DataFrame, employee_name: str, year: int, month: int
+    daily_df: pd.DataFrame,
+    employee_name: str,
+    year: int,
+    month: int,
+    special_day_items: Optional[Tuple[Tuple[str, str, str], ...]] = None
 ) -> pd.DataFrame:
-    return calculate_work_pattern_distribution(daily_df, employee_name, year, month)
+    return calculate_work_pattern_distribution(daily_df, employee_name, year, month, special_day_items)
 
 def get_work_pattern_calendar_cached(
     daily_df: pd.DataFrame,
@@ -1976,6 +2329,131 @@ def get_work_pattern_calendar_cached(
         kpi_data,
         special_day_items
     )
+
+
+def apply_annotation_overrides(
+    daily_df: pd.DataFrame,
+    special_day_items: Optional[Tuple[Tuple[str, str, str], ...]] = None
+) -> pd.DataFrame:
+    """
+    Apply persisted annotation overrides to compliance flags only.
+    Core punch data and working-hour computation remain unchanged.
+    """
+    if daily_df is None or daily_df.empty:
+        return daily_df
+
+    result_df = daily_df.copy()
+    result_df['Date'] = pd.to_datetime(result_df['Date'])
+    result_df['DateOnly'] = result_df['Date'].dt.date
+
+    special_day_map = build_special_day_map(special_day_items)
+    type_map = {d: meta.get('type', '') for d, meta in special_day_map.items()}
+    reason_map = {d: meta.get('reason', '') for d, meta in special_day_map.items()}
+
+    result_df['Annotation Type'] = result_df['DateOnly'].map(type_map).fillna('')
+    result_df['Annotation Reason'] = result_df['DateOnly'].map(reason_map).fillna('')
+    result_df['Is Annotation Holiday'] = result_df['Annotation Type'].eq('Full Off')
+
+    if 'Working Hours' not in result_df.columns:
+        result_df['Working Hours'] = 0.0
+    result_df['Overtime Eligible Hours'] = pd.to_numeric(
+        result_df['Working Hours'], errors='coerce'
+    ).fillna(0.0)
+    result_df.loc[result_df['Is Annotation Holiday'], 'Overtime Eligible Hours'] = 0.0
+
+    # Open Late: suppress all late flags for that day.
+    open_late_mask = result_df['Annotation Type'].eq('Open Late')
+    if open_late_mask.any():
+        result_df.loc[open_late_mask, 'Is Late'] = False
+        result_df.loc[open_late_mask, 'Is Very Late'] = False
+        result_df.loc[open_late_mask, 'Minutes Late'] = 0.0
+
+    # Early Close: suppress all early-departure flags for that day.
+    early_close_mask = result_df['Annotation Type'].eq('Early Close')
+    if early_close_mask.any():
+        result_df.loc[early_close_mask, 'Is Early Departure'] = False
+        result_df.loc[early_close_mask, 'Minutes Early'] = 0.0
+
+    # Full Off: treat as holiday for compliance/overtime purposes.
+    full_off_mask = result_df['Annotation Type'].eq('Full Off')
+    if full_off_mask.any():
+        result_df.loc[full_off_mask, 'Is Late'] = False
+        result_df.loc[full_off_mask, 'Is Very Late'] = False
+        result_df.loc[full_off_mask, 'Minutes Late'] = 0.0
+        result_df.loc[full_off_mask, 'Is Early Departure'] = False
+        result_df.loc[full_off_mask, 'Minutes Early'] = 0.0
+
+    # Special Hours: use adjusted open/close windows for compliance checks only.
+    late_grace_minutes = int(
+        (
+            datetime.combine(date.today(), Config.LATE_GRACE_PERIOD_END) -
+            datetime.combine(date.today(), Config.STANDARD_START_TIME)
+        ).total_seconds() / 60
+    )
+    very_late_minutes = int(
+        (
+            datetime.combine(date.today(), Config.VERY_LATE_THRESHOLD) -
+            datetime.combine(date.today(), Config.STANDARD_START_TIME)
+        ).total_seconds() / 60
+    )
+
+    for day_date, meta in special_day_map.items():
+        if meta.get('type') != 'Special Hours':
+            continue
+        open_time, close_time, _ = parse_special_hours_reason(meta.get('reason', ''))
+        if open_time is None and close_time is None:
+            continue
+
+        mask = result_df['DateOnly'].eq(day_date)
+        if not mask.any():
+            continue
+
+        if open_time is not None:
+            late_cutoff = _add_minutes_to_time(open_time, late_grace_minutes)
+            very_late_cutoff = _add_minutes_to_time(open_time, very_late_minutes)
+            punch_in_series = result_df.loc[mask, 'First Punch In']
+            is_late_series = punch_in_series.apply(
+                lambda x: pd.notna(x) and x.time() > late_cutoff
+            )
+            is_very_late_series = punch_in_series.apply(
+                lambda x: pd.notna(x) and x.time() > very_late_cutoff
+            )
+            minutes_late_series = punch_in_series.apply(
+                lambda x: max(
+                    0.0,
+                    (
+                        datetime.combine(date.today(), x.time()) -
+                        datetime.combine(date.today(), open_time)
+                    ).total_seconds() / 60
+                ) if pd.notna(x) and x.time() > late_cutoff else 0.0
+            )
+            result_df.loc[mask, 'Is Late'] = is_late_series.values
+            result_df.loc[mask, 'Is Very Late'] = is_very_late_series.values
+            result_df.loc[mask, 'Minutes Late'] = minutes_late_series.values
+
+        if close_time is not None:
+            punch_out_series = result_df.loc[mask, 'Last Punch Out']
+            if 'Missing Punch Out' in result_df.columns:
+                missing_out_series = result_df.loc[mask, 'Missing Punch Out'].fillna(False).astype(bool)
+            else:
+                missing_out_series = pd.Series(False, index=punch_out_series.index)
+            is_early_series = punch_out_series.apply(
+                lambda x: pd.notna(x) and x.time() < close_time
+            ) & (~missing_out_series)
+            minutes_early_series = punch_out_series.apply(
+                lambda x: max(
+                    0.0,
+                    (
+                        datetime.combine(date.today(), close_time) -
+                        datetime.combine(date.today(), x.time())
+                    ).total_seconds() / 60
+                ) if pd.notna(x) and x.time() < close_time else 0.0
+            )
+            minutes_early_series = minutes_early_series.where(~missing_out_series, 0.0)
+            result_df.loc[mask, 'Is Early Departure'] = is_early_series.values
+            result_df.loc[mask, 'Minutes Early'] = minutes_early_series.values
+
+    return result_df.drop(columns=['DateOnly'], errors='ignore')
 
 def get_weekly_employee_comparison_cached(
     daily_df: pd.DataFrame,
@@ -2503,33 +2981,49 @@ def calculate_weekly_employee_comparison(
         work_df['Meal Hours'] = 0.0
 
     work_df['Working Hours'] = pd.to_numeric(work_df['Working Hours'], errors='coerce').fillna(0.0)
+    if 'Overtime Eligible Hours' in work_df.columns:
+        work_df['Overtime Calc Hours'] = pd.to_numeric(
+            work_df['Overtime Eligible Hours'], errors='coerce'
+        ).fillna(work_df['Working Hours'])
+    else:
+        work_df['Overtime Calc Hours'] = work_df['Working Hours']
     work_df['Meal Hours'] = pd.to_numeric(work_df['Meal Hours'], errors='coerce').fillna(0.0)
-    work_df['No Lunch Day'] = work_df['Meal Hours'] <= (10 / 60)
+    friday_mask = work_df['Date'].dt.weekday == 4
+    base_no_lunch = work_df['Meal Hours'] <= (10 / 60)
     work_df['High Risk No Lunch Day'] = (
         (work_df['Working Hours'] >= 8.0) &
-        (work_df['No Lunch Day'])
+        base_no_lunch
     )
+    # Friday rule: ignore normal Friday lunch cases, keep 8h+ no-lunch Fridays.
+    lunch_analysis_mask = (~friday_mask) | work_df['High Risk No Lunch Day']
+    work_df['No Lunch Day'] = base_no_lunch & lunch_analysis_mask
+    work_df['Meal Analysis Day'] = lunch_analysis_mask.astype(int)
+    work_df['Meal Hours Analysis'] = np.where(lunch_analysis_mask, work_df['Meal Hours'], 0.0)
 
     work_df['Week Start'] = work_df['Date'] - pd.to_timedelta(work_df['Date'].dt.weekday, unit='D')
     work_df['Week End'] = work_df['Week Start'] + pd.to_timedelta(4, unit='D')
 
     weekly_df = work_df.groupby(['Employee Full Name', 'Week Start', 'Week End']).agg({
         'Working Hours': 'sum',
+        'Overtime Calc Hours': 'sum',
         'Date': 'nunique',
         'Is Late': 'sum',
         'Is Early Departure': 'sum',
         'Has Anomaly': 'sum',
         'Missing Punch Out': 'sum',
         'Meal Hours': 'sum',
+        'Meal Analysis Day': 'sum',
+        'Meal Hours Analysis': 'sum',
         'No Lunch Day': 'sum',
         'High Risk No Lunch Day': 'sum'
     }).reset_index()
 
     weekly_df.columns = [
         'Employee Full Name', 'Week Start', 'Week End',
-        'Total Working Hours', 'Working Days',
+        'Total Working Hours', 'Overtime Calc Hours', 'Working Days',
         'Late Days', 'Early Departure Days', 'Anomaly Days',
-        'Missing Punch-Out Days', 'Total Meal Hours',
+        'Missing Punch-Out Days', 'Total Meal Hours', 'Meal Analysis Days',
+        'Meal Hours (Analysis)',
         'No Lunch Days', '8h+ No Lunch Days'
     ]
 
@@ -2551,13 +3045,14 @@ def calculate_weekly_employee_comparison(
         )
 
     weekly_df['Expected Hours'] = expected_hours
-    weekly_df['Hours Gap'] = weekly_df['Total Working Hours'] - weekly_df['Expected Hours']
+    weekly_df['Hours Gap'] = weekly_df['Overtime Calc Hours'] - weekly_df['Expected Hours']
     weekly_df['Overtime Hours'] = weekly_df['Hours Gap'].clip(lower=0)
     weekly_df['Avg Meal / Day (min)'] = np.where(
-        weekly_df['Working Days'] > 0,
-        (weekly_df['Total Meal Hours'] * 60) / weekly_df['Working Days'],
+        weekly_df['Meal Analysis Days'] > 0,
+        (weekly_df['Meal Hours (Analysis)'] * 60) / weekly_df['Meal Analysis Days'],
         0.0
     )
+    weekly_df = weekly_df.drop(columns=['Meal Analysis Days', 'Meal Hours (Analysis)', 'Overtime Calc Hours'])
 
     week_starts = sorted(weekly_df['Week Start'].dropna().unique())
     week_index_map = {ws: idx + 1 for idx, ws in enumerate(week_starts)}
@@ -2805,48 +3300,56 @@ def calculate_lunch_break_risk(
         break_counts = pd.Series(0, index=work_df.index)
 
     work_df['Meal Minutes'] = work_df['Meal Hours'] * 60
-    work_df['No Lunch Day'] = work_df['Meal Minutes'] <= 1
-    work_df['Short Lunch Day'] = (
-        (work_df['Meal Minutes'] > 1) &
-        (work_df['Meal Minutes'] < short_lunch_minutes)
-    )
+    friday_mask = work_df['Date'].dt.weekday == 4
+    no_lunch_base = work_df['Meal Minutes'] <= 1
     work_df['High-Risk No Lunch Day'] = (
         (work_df['Working Hours'] >= high_work_hours) &
-        (work_df['No Lunch Day'])
+        no_lunch_base
     )
-    work_df['Long Continuous Work Day'] = (
+    # Friday rule: ignore normal Friday lunch cases, keep 8h+ no-lunch Fridays.
+    lunch_analysis_mask = (~friday_mask) | work_df['High-Risk No Lunch Day']
+    work_df['Lunch Analysis Day'] = lunch_analysis_mask
+    work_df['No Lunch Day'] = no_lunch_base & lunch_analysis_mask
+    work_df['Short Lunch Day'] = (
+        (work_df['Meal Minutes'] > 1) &
+        (work_df['Meal Minutes'] < short_lunch_minutes) &
+        lunch_analysis_mask
+    )
+    long_continuous_mask = (
         ((break_counts <= 0) & (work_df['Working Hours'] >= long_continuous_hours)) |
         ((work_df['Meal Minutes'] < max(10, short_lunch_minutes * 0.5)) & (work_df['Working Hours'] >= high_work_hours))
     )
+    work_df['Long Continuous Work Day'] = long_continuous_mask & lunch_analysis_mask
 
     risk_rows = []
     for employee_name, emp_df in work_df.groupby('Employee Full Name'):
         emp_df = emp_df.sort_values('Date')
-        working_days = int(emp_df['Date'].nunique())
-        total_work_hours = float(emp_df['Working Hours'].sum())
-        total_meal_hours = float(emp_df['Meal Hours'].sum())
+        analysis_df = emp_df[emp_df['Lunch Analysis Day']].copy()
+        working_days = int(analysis_df['Date'].nunique())
+        total_work_hours = float(analysis_df['Working Hours'].sum())
+        total_meal_hours = float(analysis_df['Meal Hours'].sum())
         avg_lunch_minutes = (total_meal_hours * 60 / working_days) if working_days > 0 else 0.0
 
-        no_lunch_days = int(emp_df['No Lunch Day'].sum())
-        short_lunch_days = int(emp_df['Short Lunch Day'].sum())
-        long_continuous_days = int(emp_df['Long Continuous Work Day'].sum())
-        high_risk_days = int(emp_df['High-Risk No Lunch Day'].sum())
-        max_no_lunch_streak = _longest_true_streak(emp_df['No Lunch Day'])
-        max_high_risk_streak = _longest_true_streak(emp_df['High-Risk No Lunch Day'])
+        no_lunch_days = int(analysis_df['No Lunch Day'].sum())
+        short_lunch_days = int(analysis_df['Short Lunch Day'].sum())
+        long_continuous_days = int(analysis_df['Long Continuous Work Day'].sum())
+        high_risk_days = int(analysis_df['High-Risk No Lunch Day'].sum())
+        max_no_lunch_streak = _longest_true_streak(analysis_df['No Lunch Day']) if working_days > 0 else 0
+        max_high_risk_streak = _longest_true_streak(analysis_df['High-Risk No Lunch Day']) if working_days > 0 else 0
 
         risk_score = 0
         risk_score += high_risk_days * 2
-        risk_score += 2 if avg_lunch_minutes < avg_lunch_warning_minutes else 0
+        risk_score += 2 if (working_days > 0 and avg_lunch_minutes < avg_lunch_warning_minutes) else 0
         risk_score += 2 if no_lunch_days >= 3 else 0
         risk_score += 2 if short_lunch_days >= 4 else 0
         risk_score += 2 if long_continuous_days >= 3 else 0
         risk_score += 3 if max_high_risk_streak >= 3 else 0
 
-        if max_high_risk_streak >= 3 or high_risk_days >= 5 or avg_lunch_minutes < 10:
+        if max_high_risk_streak >= 3 or high_risk_days >= 5 or (working_days > 0 and avg_lunch_minutes < 10):
             risk_level = 'Critical'
         elif risk_score >= 8 or high_risk_days >= 3:
             risk_level = 'High'
-        elif risk_score >= 4 or avg_lunch_minutes < avg_lunch_warning_minutes:
+        elif risk_score >= 4 or (working_days > 0 and avg_lunch_minutes < avg_lunch_warning_minutes):
             risk_level = 'Warning'
         else:
             risk_level = 'Low'
@@ -2854,14 +3357,17 @@ def calculate_lunch_break_risk(
         reasons = []
         if high_risk_days > 0:
             reasons.append(f"{high_risk_days} day(s) worked {high_work_hours:.1f}h+ with no lunch")
-        if avg_lunch_minutes < avg_lunch_warning_minutes:
+        if working_days > 0 and avg_lunch_minutes < avg_lunch_warning_minutes:
             reasons.append(f"Average lunch is only {avg_lunch_minutes:.1f} min")
         if max_high_risk_streak >= 2:
             reasons.append(f"{max_high_risk_streak}-day consecutive high-risk streak")
         if long_continuous_days > 0:
             reasons.append(f"{long_continuous_days} long continuous-work day(s)")
         if not reasons:
-            reasons.append("Lunch behavior appears stable in this month.")
+            if working_days == 0:
+                reasons.append("Only standard Friday cases found; excluded from lunch analysis.")
+            else:
+                reasons.append("Lunch behavior appears stable in this month.")
 
         risk_rows.append({
             'Employee Full Name': employee_name,
@@ -3154,7 +3660,13 @@ def get_employee_work_pattern(employee_name: str):
     pattern = work_patterns.get(first_name, {'workdays': default_workdays})
     return pattern['workdays'], pattern.get('early_departure')
 
-def calculate_work_pattern_summary(daily_df: pd.DataFrame, employee_name: str, year: int, month: int) -> Dict[str, int]:
+def calculate_work_pattern_summary(
+    daily_df: pd.DataFrame,
+    employee_name: str,
+    year: int,
+    month: int,
+    special_day_items: Optional[Tuple[Tuple[str, str, str], ...]] = None
+) -> Dict[str, int]:
     """
     Summarize attendance counts using employee-specific work patterns.
     """
@@ -3163,7 +3675,7 @@ def calculate_work_pattern_summary(daily_df: pd.DataFrame, employee_name: str, y
     emp_df = emp_df[(emp_df['Date'].dt.year == year) & (emp_df['Date'].dt.month == month)]
     
     expected_workdays, _ = get_employee_work_pattern(employee_name)
-    holiday_map = get_company_holidays(year)
+    holiday_map = get_effective_holiday_map(year, special_day_items)
     date_status = {row['Date'].day: row for _, row in emp_df.iterrows()}
     days_in_month = calendar.monthrange(year, month)[1]
     
@@ -3219,11 +3731,17 @@ def calculate_work_pattern_summary(daily_df: pd.DataFrame, employee_name: str, y
     
     return summary
 
-def calculate_work_pattern_distribution(daily_df: pd.DataFrame, employee_name: str, year: int, month: int) -> pd.DataFrame:
+def calculate_work_pattern_distribution(
+    daily_df: pd.DataFrame,
+    employee_name: str,
+    year: int,
+    month: int,
+    special_day_items: Optional[Tuple[Tuple[str, str, str], ...]] = None
+) -> pd.DataFrame:
     """
     Build a distribution DataFrame based on work pattern summary.
     """
-    summary = calculate_work_pattern_summary(daily_df, employee_name, year, month)
+    summary = calculate_work_pattern_summary(daily_df, employee_name, year, month, special_day_items)
     distribution = [
         {'Attendance Type': 'Full Day', 'Count': summary['full_days']},
         {'Attendance Type': 'Half Day', 'Count': summary['half_days']},
@@ -3304,7 +3822,13 @@ def calculate_expected_hours_for_range(employee_name: str, start_date: date, end
         current += timedelta(days=1)
     return total_hours
 
-def calculate_work_pattern_kpis(daily_df: pd.DataFrame, employee_name: str, year: int, month: int) -> Dict[str, float]:
+def calculate_work_pattern_kpis(
+    daily_df: pd.DataFrame,
+    employee_name: str,
+    year: int,
+    month: int,
+    special_day_items: Optional[Tuple[Tuple[str, str, str], ...]] = None
+) -> Dict[str, float]:
     """
     Calculate expected vs actual and punctuality KPIs for the work pattern calendar.
     """
@@ -3315,7 +3839,7 @@ def calculate_work_pattern_kpis(daily_df: pd.DataFrame, employee_name: str, year
 
     expected_workdays, early_departure_override = get_employee_work_pattern(employee_name)
     days_in_month = calendar.monthrange(year, month)[1]
-    holiday_map = get_company_holidays(year)
+    holiday_map = get_effective_holiday_map(year, special_day_items)
 
     expected_dates = []
     expected_hours = 0.0
@@ -3367,9 +3891,13 @@ def calculate_work_pattern_kpis(daily_df: pd.DataFrame, employee_name: str, year
         # Working-day lunch KPIs (expected workdays only -> excludes holidays and week-offs)
         worked_day_mask = work_hours_series > 0
         no_lunch_mask = meal_hours_series <= 0
-        no_lunch_working_days = int((worked_day_mask & no_lunch_mask).sum())
+        friday_mask = expected_df['Date'].dt.weekday == 4
+        high_risk_no_lunch_mask = worked_day_mask & (work_hours_series >= 8.0) & no_lunch_mask
+        # Friday rule: ignore normal Friday no-lunch counts, keep 8h+ no-lunch Fridays.
+        lunch_analysis_mask = (~friday_mask) | high_risk_no_lunch_mask
+        no_lunch_working_days = int((worked_day_mask & no_lunch_mask & lunch_analysis_mask).sum())
         high_risk_no_lunch_days = int(
-            (worked_day_mask & (work_hours_series >= 8.0) & no_lunch_mask).sum()
+            high_risk_no_lunch_mask.sum()
         )
     else:
         late_count = 0
@@ -3422,22 +3950,12 @@ def create_work_pattern_calendar(
     
     # Create date mapping
     date_status = {row['Date'].day: row for _, row in emp_df.iterrows()}
-    holiday_map = get_holiday_map(year)
+    holiday_map = get_effective_holiday_map(year, special_day_items)
 
     if kpi_data is None:
-        kpi_data = calculate_work_pattern_kpis(daily_df, employee_name, year, month)
+        kpi_data = calculate_work_pattern_kpis(daily_df, employee_name, year, month, special_day_items)
 
-    special_day_map: Dict[date, Dict[str, str]] = {}
-    if special_day_items:
-        for date_str, day_type, reason in special_day_items:
-            try:
-                day_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-            except (TypeError, ValueError):
-                continue
-            special_day_map[day_date] = {
-                'type': str(day_type or 'Special Day'),
-                'reason': str(reason or '').strip()
-            }
+    special_day_map = build_special_day_map(special_day_items)
 
     expected_days = int(kpi_data.get('expected_days', 0) or 0)
     actual_days = int(kpi_data.get('actual_days', 0) or 0)
@@ -3514,7 +4032,7 @@ def create_work_pattern_calendar(
         .cal-wrap{font-family:Arial,sans-serif;max-width:980px;margin:0 auto;padding:16px;background:linear-gradient(180deg,#f5f8fb 0%,#fff 60%);border:1px solid #dde6ef;border-radius:12px;box-shadow:0 6px 18px rgba(22,43,60,.08);}
         .cal-header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;}
         .cal-title{font-size:20px;font-weight:700;color:#1f5f7a;}
-        .cal-subtitle{font-size:12px;color:#5d6c79;}
+        .cal-subtitle{font-size:14px;font-weight:600;color:#4b5b66;}
         .status-summary{background:#fff;border:1px solid #dde6ef;border-radius:10px;padding:8px 10px;min-width:220px;}
         .status-label{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:#5d6c79;}
         .status-value{font-size:20px;font-weight:700;margin-top:4px;}
@@ -3550,7 +4068,11 @@ def create_work_pattern_calendar(
         .badge-holiday{border-color:#2E86AB;background:#e8f1ff;color:#1f5f7a;}
         .ot-pill{font-size:9px;font-weight:700;padding:2px 6px;border-radius:6px;background:#edf0f3;border:1px dashed #c7d1dc;color:#2f3a43;}
         .badge-special{border-color:#1f7a6b;background:#e6f6f4;color:#145b4f;}
-        .time-range{font-size:10px;color:#4b5b66;margin-top:4px;min-height:12px;}
+        .time-range{font-size:10px;color:#4b5b66;margin-top:4px;min-height:12px;line-height:1.35;}
+        .time-chunk{display:inline-block;margin-right:8px;}
+        .time-label{color:#4b5b66;}
+        .time-value{font-weight:600;color:#4b5b66;}
+        .time-value.alert{color:#c7392f;}
         .meal-text{font-size:10px;color:#6b7280;margin-top:2px;min-height:12px;}
         .meal-text.meal-risk-warning{color:#7a5d00;background:rgba(242,201,76,0.18);border:1px solid rgba(242,201,76,0.35);padding:1px 4px;border-radius:4px;font-weight:600;display:inline-block;}
         .meal-text.meal-risk-critical{color:#8a1f1f;background:rgba(235,87,87,0.16);border:1px solid rgba(235,87,87,0.35);padding:1px 4px;border-radius:4px;font-weight:700;display:inline-block;}
@@ -3692,13 +4214,18 @@ def create_work_pattern_calendar(
                 worked_on_non_working = not is_expected_workday
                 hours = float(day_info.get('Working Hours', 0.0) or 0.0)
                 meal_hours = float(day_info.get('Meal Hours', 0.0) or 0.0)
+                overtime_hours_basis = float(day_info.get('Overtime Eligible Hours', hours) or 0.0)
                 meal_minutes = meal_hours * 60.0
+                is_friday = weekday == 4
                 meal_risk = None
-                if hours >= Config.MEAL_RISK_LONG_DAY_HOURS:
-                    if meal_minutes <= Config.MEAL_RISK_CRITICAL_MINUTES:
-                        meal_risk = 'critical'
-                    elif meal_minutes < Config.MEAL_RISK_WARNING_MINUTES:
-                        meal_risk = 'warning'
+                if hours >= Config.MEAL_RISK_LONG_DAY_HOURS and meal_minutes <= Config.MEAL_RISK_CRITICAL_MINUTES:
+                    meal_risk = 'critical'
+                elif (
+                    (not is_friday) and
+                    (hours >= Config.MEAL_RISK_LONG_DAY_HOURS) and
+                    (meal_minutes < Config.MEAL_RISK_WARNING_MINUTES)
+                ):
+                    meal_risk = 'warning'
                 if meal_risk == 'critical':
                     meal_class = 'meal-risk-critical'
                 elif meal_risk == 'warning':
@@ -3706,9 +4233,9 @@ def create_work_pattern_calendar(
                 else:
                     meal_class = ''
                 if weekday == 4:
-                    daily_overtime = max(0.0, hours - 5.0)
+                    daily_overtime = max(0.0, overtime_hours_basis - 5.0)
                 else:
-                    daily_overtime = max(0.0, hours - 8.75)
+                    daily_overtime = max(0.0, overtime_hours_basis - 8.75)
                 bg_color = colors.get(status, '#ffffff')
                 pill_color = pill_colors.get(status, '#2E86AB')
                 text_color = text_colors.get(status, '#1a1a1a')
@@ -3720,7 +4247,10 @@ def create_work_pattern_calendar(
                 # Tooltip info
                 info = f"Status: {shift_type} | Hours: {hours:.1f}h"
                 if special_day:
-                    special_text = f"Special Day: {special_label or 'Special Day'}"
+                    if special_label == 'Full Off':
+                        special_text = "Annotation: Full Off"
+                    else:
+                        special_text = f"Special Day: {special_label or 'Special Day'}"
                     if special_reason:
                         special_text += f" ({special_reason})"
                     info = f"{special_text} | {info}"
@@ -3775,7 +4305,7 @@ def create_work_pattern_calendar(
                     badges.append('<span class="badge badge-miss" title="Missing Punch Out">M</span>')
                 if day_info.get('Has Anomaly', False):
                     badges.append('<span class="badge badge-anom" title="Anomaly">A</span>')
-                if special_day:
+                if special_day and special_label != 'Full Off':
                     special_badge_text = special_label or 'Special'
                     special_title = special_badge_text
                     if special_reason:
@@ -3785,9 +4315,23 @@ def create_work_pattern_calendar(
                         f'<span class="badge badge-special" title="{special_title}">{special_badge_text}</span>'
                     )
 
+                is_late_arrival = bool(day_info.get('Is Late', False))
                 in_time = day_info['First Punch In'].strftime('%H:%M') if pd.notna(day_info.get('First Punch In')) else '--'
                 out_time = day_info['Last Punch Out'].strftime('%H:%M') if pd.notna(day_info.get('Last Punch Out')) else '--'
-                time_range = f"{in_time} - {out_time}" if in_time != '--' or out_time != '--' else ''
+                time_chunks = []
+                if in_time != '--':
+                    in_time_class = "time-value alert" if is_late_arrival else "time-value"
+                    time_chunks.append(
+                        f'<span class="time-chunk"><span class="time-label">In:</span> '
+                        f'<span class="{in_time_class}">{in_time}</span></span>'
+                    )
+                if out_time != '--':
+                    out_time_class = "time-value alert" if is_early_departure else "time-value"
+                    time_chunks.append(
+                        f'<span class="time-chunk"><span class="time-label">Out:</span> '
+                        f'<span class="{out_time_class}">{out_time}</span></span>'
+                    )
+                time_range = ''.join(time_chunks)
 
                 if expected_hours_day > 0:
                     ratio = max(0.0, min(hours / expected_hours_day, 1.0))
@@ -3830,7 +4374,7 @@ def create_work_pattern_calendar(
                 html += '</div>'
                 html += '</td>'
             else:
-                if special_day:
+                if special_day and special_label != 'Full Off':
                     bg_color = colors['special']
                     pill_color = pill_colors['special']
                     cell_style = (
@@ -4107,7 +4651,18 @@ def main():
     # FILE MANAGEMENT & PERSISTENCE
     st.sidebar.markdown("---")
     st.sidebar.subheader("\U0001F4CA Data Management")
-    uploaded_file = st.sidebar.file_uploader("Update Data Source", type=['xlsx', 'xls'])
+    if st.sidebar.button("RESET DATA", key="reset_data_btn", use_container_width=True):
+        reset_ok, reset_msg = _reset_dashboard_data_state()
+        if reset_ok:
+            st.sidebar.success(reset_msg)
+            if hasattr(st, "rerun"):
+                st.rerun()
+            else:
+                st.experimental_rerun()
+        else:
+            st.sidebar.error(reset_msg)
+
+    uploaded_file = st.sidebar.file_uploader("Update Data Source", type=['xlsx', 'xls'], key="data_upload_source")
     
     data_source = None
     
@@ -4195,6 +4750,12 @@ def main():
         else:
             st.error(f"Error loading data: {message}")
             st.stop()
+
+    # Apply persisted annotation overrides after base processing.
+    annotation_items = get_annotation_items_from_db()
+    daily_df = apply_annotation_overrides(daily_df, annotation_items)
+    emp_metrics_df = FeatureEngineer.calculate_productivity_metrics(daily_df)
+    weekly_overtime_df, monthly_overtime_df = FeatureEngineer.calculate_overtime_metrics(daily_df)
     
     # ========================================================================
     # SIDEBAR CONTROLS
@@ -4748,136 +5309,213 @@ def main():
             st.caption("This view uses month/year controls and summarizes attendance week-by-week.")
 
             available_years = sorted(week_source_df['Date'].dt.year.unique().tolist(), reverse=True)
-            ctrl1, ctrl2, ctrl3 = st.columns([1, 1, 2])
-            with ctrl1:
-                selected_year_week = st.selectbox(
-                    "Select Year",
-                    available_years,
-                    key="wk_cmp_year"
-                )
-            with ctrl2:
-                available_months_week = sorted(
-                    week_source_df[week_source_df['Date'].dt.year == selected_year_week]['Date'].dt.month.unique().tolist()
-                )
-                selected_month_week = st.selectbox(
-                    "Select Month",
-                    available_months_week,
-                    format_func=lambda x: calendar.month_name[x],
-                    key="wk_cmp_month"
-                )
-            with ctrl3:
-                weekday_options = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
-                selected_weekdays = st.multiselect(
-                    "Weekday Focus (Optional)",
-                    weekday_options,
-                    default=weekday_options,
-                    key="wk_cmp_weekdays"
-                )
-
-            employee_options_week = sorted(
-                week_source_df[
-                    (week_source_df['Date'].dt.year == selected_year_week) &
-                    (week_source_df['Date'].dt.month == selected_month_week)
-                ]['Employee Full Name'].unique().tolist()
-            )
-            default_week_employees = (
-                [emp for emp in selected_employees if emp in set(employee_options_week)][:10]
-                if selected_employees else employee_options_week[:min(5, len(employee_options_week))]
-            )
-            selected_week_employees = st.multiselect(
-                "Select Employees for Weekly Comparison (up to 10)",
-                employee_options_week,
-                default=default_week_employees,
-                key="wk_cmp_employees"
+            available_month_pairs = sorted(
+                {
+                    (int(ts.year), int(ts.month))
+                    for ts in week_source_df['Date'].dropna()
+                }
             )
 
-            if len(selected_week_employees) > 10:
-                st.warning("Showing first 10 selected employees for readability.")
-                selected_week_employees = selected_week_employees[:10]
-
-            weekday_scope = selected_weekdays if selected_weekdays else weekday_options
-            if len(selected_week_employees) == 0:
-                st.info("Select at least one employee to render week-wise comparison.")
+            if not available_month_pairs:
+                st.info("No month data available for week-wise comparison.")
             else:
-                weekly_comp_df = get_weekly_employee_comparison_cached(
-                    week_source_df,
-                    selected_year_week,
-                    selected_month_week,
-                    tuple(selected_week_employees),
-                    tuple(weekday_scope)
+                latest_year, latest_month = available_month_pairs[-1]
+                current_pair = (
+                    int(st.session_state.get("wk_cmp_year", latest_year)),
+                    int(st.session_state.get("wk_cmp_month", latest_month))
                 )
-                weekly_comp_df = ensure_week_index_column(weekly_comp_df)
+                if current_pair not in available_month_pairs:
+                    st.session_state.wk_cmp_year = latest_year
+                    st.session_state.wk_cmp_month = latest_month
 
-                if weekly_comp_df.empty:
-                    st.info("No weekly comparison data available for the current month and selection.")
+                def _wk_cmp_prev_month():
+                    selected_pair = (
+                        int(st.session_state.get("wk_cmp_year", latest_year)),
+                        int(st.session_state.get("wk_cmp_month", latest_month))
+                    )
+                    if selected_pair not in available_month_pairs:
+                        st.session_state.wk_cmp_year = latest_year
+                        st.session_state.wk_cmp_month = latest_month
+                        return
+                    idx = available_month_pairs.index(selected_pair)
+                    if idx > 0:
+                        prev_year, prev_month = available_month_pairs[idx - 1]
+                        st.session_state.wk_cmp_year = prev_year
+                        st.session_state.wk_cmp_month = prev_month
+
+                def _wk_cmp_next_month():
+                    selected_pair = (
+                        int(st.session_state.get("wk_cmp_year", latest_year)),
+                        int(st.session_state.get("wk_cmp_month", latest_month))
+                    )
+                    if selected_pair not in available_month_pairs:
+                        st.session_state.wk_cmp_year = latest_year
+                        st.session_state.wk_cmp_month = latest_month
+                        return
+                    idx = available_month_pairs.index(selected_pair)
+                    if idx < len(available_month_pairs) - 1:
+                        next_year, next_month = available_month_pairs[idx + 1]
+                        st.session_state.wk_cmp_year = next_year
+                        st.session_state.wk_cmp_month = next_month
+
+                ctrl1, ctrl2, ctrl3 = st.columns([1, 1, 2])
+                with ctrl1:
+                    selected_year_week = st.selectbox(
+                        "Select Year",
+                        available_years,
+                        key="wk_cmp_year"
+                    )
+                with ctrl2:
+                    available_months_week = sorted(
+                        [month for year, month in available_month_pairs if year == selected_year_week]
+                    )
+                    if st.session_state.get("wk_cmp_month") not in available_months_week:
+                        st.session_state.wk_cmp_month = available_months_week[-1]
+                    selected_month_week = st.selectbox(
+                        "Select Month",
+                        available_months_week,
+                        format_func=lambda x: calendar.month_name[x],
+                        key="wk_cmp_month"
+                    )
+                with ctrl3:
+                    weekday_options = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday']
+                    selected_weekdays = st.multiselect(
+                        "Weekday Focus (Optional)",
+                        weekday_options,
+                        default=weekday_options,
+                        key="wk_cmp_weekdays"
+                    )
+
+                selected_pair = (selected_year_week, selected_month_week)
+                selected_idx = available_month_pairs.index(selected_pair)
+                nav_cols = st.columns([1, 8, 1])
+                with nav_cols[0]:
+                    st.button(
+                        "◀",
+                        key="wk_cmp_prev_nav",
+                        help="Previous month",
+                        on_click=_wk_cmp_prev_month,
+                        disabled=selected_idx <= 0
+                    )
+                with nav_cols[1]:
+                    st.markdown(
+                        f"<div style='text-align:center; font-weight:600; color:#2E86AB; padding-top:6px;'>"
+                        f"{calendar.month_name[selected_month_week]} {selected_year_week}</div>",
+                        unsafe_allow_html=True
+                    )
+                with nav_cols[2]:
+                    st.button(
+                        "▶",
+                        key="wk_cmp_next_nav",
+                        help="Next month",
+                        on_click=_wk_cmp_next_month,
+                        disabled=selected_idx >= (len(available_month_pairs) - 1)
+                    )
+
+                employee_options_week = sorted(
+                    week_source_df[
+                        (week_source_df['Date'].dt.year == selected_year_week) &
+                        (week_source_df['Date'].dt.month == selected_month_week)
+                    ]['Employee Full Name'].unique().tolist()
+                )
+                default_week_employees = (
+                    [emp for emp in selected_employees if emp in set(employee_options_week)][:10]
+                    if selected_employees else employee_options_week[:min(5, len(employee_options_week))]
+                )
+                selected_week_employees = st.multiselect(
+                    "Select Employees for Weekly Comparison (up to 10)",
+                    employee_options_week,
+                    default=default_week_employees,
+                    key="wk_cmp_employees"
+                )
+
+                if len(selected_week_employees) > 10:
+                    st.warning("Showing first 10 selected employees for readability.")
+                    selected_week_employees = selected_week_employees[:10]
+
+                weekday_scope = selected_weekdays if selected_weekdays else weekday_options
+                if len(selected_week_employees) == 0:
+                    st.info("Select at least one employee to render week-wise comparison.")
                 else:
-                    kpi_a, kpi_b, kpi_c, kpi_d = st.columns(4)
-                    with kpi_a:
-                        create_metric_card("Employee-Weeks", int(len(weekly_comp_df)))
-                    with kpi_b:
-                        create_metric_card("Avg Hours / Employee-Week", f"{weekly_comp_df['Total Working Hours'].mean():.1f}h")
-                    with kpi_c:
-                        create_metric_card("Total Overtime", f"{weekly_comp_df['Overtime Hours'].sum():.1f}h")
-                    with kpi_d:
-                        flagged_weeks = (
-                            (weekly_comp_df['Anomaly Days'] > 0) |
-                            (weekly_comp_df['Late Days'] > 0) |
-                            (weekly_comp_df['Early Departure Days'] > 0)
-                        ).sum()
-                        create_metric_card("Flagged Weeks", int(flagged_weeks))
+                    weekly_comp_df = get_weekly_employee_comparison_cached(
+                        week_source_df,
+                        selected_year_week,
+                        selected_month_week,
+                        tuple(selected_week_employees),
+                        tuple(weekday_scope)
+                    )
+                    weekly_comp_df = ensure_week_index_column(weekly_comp_df)
 
-                    week_heatmap = plot_weekly_comparison_heatmap(
-                        weekly_comp_df,
-                        selected_week_employees
-                    )
-                    if week_heatmap is not None:
-                        st.plotly_chart(week_heatmap, use_container_width=True)
-                    st.caption("Cell text shows total hours + worked days. Hover for overtime, timing, anomalies, and lunch signals.")
+                    if weekly_comp_df.empty:
+                        st.info("No weekly comparison data available for the current month and selection.")
+                    else:
+                        kpi_a, kpi_b, kpi_c, kpi_d = st.columns(4)
+                        with kpi_a:
+                            create_metric_card("Employee-Weeks", int(len(weekly_comp_df)))
+                        with kpi_b:
+                            create_metric_card("Avg Hours / Employee-Week", f"{weekly_comp_df['Total Working Hours'].mean():.1f}h")
+                        with kpi_c:
+                            create_metric_card("Total Overtime", f"{weekly_comp_df['Overtime Hours'].sum():.1f}h")
+                        with kpi_d:
+                            flagged_weeks = (
+                                (weekly_comp_df['Anomaly Days'] > 0) |
+                                (weekly_comp_df['Late Days'] > 0) |
+                                (weekly_comp_df['Early Departure Days'] > 0)
+                            ).sum()
+                            create_metric_card("Flagged Weeks", int(flagged_weeks))
 
-                    st.markdown("### Weekly Matrix Snapshot")
-                    snapshot_df = weekly_comp_df.copy()
-                    snapshot_df['Summary'] = snapshot_df.apply(
-                        lambda r: (
-                            f"{r['Total Working Hours']:.1f}h | {int(r['Working Days'])}d | "
-                            f"OT {r['Overtime Hours']:.1f}h | A {int(r['Anomaly Days'])}"
-                        ),
-                        axis=1
-                    )
-                    week_order = (
-                        snapshot_df[['Week Index', 'Week Label']]
-                        .drop_duplicates()
-                        .sort_values('Week Index')['Week Label']
-                        .tolist()
-                    )
-                    matrix_df = snapshot_df.pivot(
-                        index='Week Label',
-                        columns='Employee Full Name',
-                        values='Summary'
-                    ).reindex(week_order)
-                    ordered_cols = [emp for emp in selected_week_employees if emp in matrix_df.columns]
-                    ordered_cols += [col for col in matrix_df.columns if col not in set(ordered_cols)]
-                    matrix_df = matrix_df[ordered_cols]
-                    st.dataframe(matrix_df.fillna("-"), use_container_width=True)
+                        week_heatmap = plot_weekly_comparison_heatmap(
+                            weekly_comp_df,
+                            selected_week_employees
+                        )
+                        if week_heatmap is not None:
+                            st.plotly_chart(week_heatmap, use_container_width=True)
+                        st.caption("Cell text shows total hours + worked days. Hover for overtime, timing, anomalies, and lunch signals.")
 
-                    st.markdown("### Weekly Detailed Metrics")
-                    detail_cols = [
-                        'Week Label', 'Employee Full Name', 'Total Working Hours', 'Expected Hours',
-                        'Overtime Hours', 'Working Days', 'Late Days', 'Early Departure Days',
-                        'Anomaly Days', 'No Lunch Days', '8h+ No Lunch Days', 'Avg Meal / Day (min)'
-                    ]
-                    sort_cols = ['Total Working Hours']
-                    sort_ascending = [False]
-                    if 'Week Index' in weekly_comp_df.columns:
-                        sort_cols = ['Week Index', 'Total Working Hours']
-                        sort_ascending = [True, False]
-                    st.dataframe(
-                        weekly_comp_df.sort_values(
-                            sort_cols,
-                            ascending=sort_ascending
-                        )[detail_cols],
-                        use_container_width=True,
-                        height=420
-                    )
+                        st.markdown("### Weekly Matrix Snapshot")
+                        snapshot_df = weekly_comp_df.copy()
+                        snapshot_df['Summary'] = snapshot_df.apply(
+                            lambda r: (
+                                f"{r['Total Working Hours']:.1f}h | {int(r['Working Days'])}d | "
+                                f"OT {r['Overtime Hours']:.1f}h | A {int(r['Anomaly Days'])}"
+                            ),
+                            axis=1
+                        )
+                        week_order = (
+                            snapshot_df[['Week Index', 'Week Label']]
+                            .drop_duplicates()
+                            .sort_values('Week Index')['Week Label']
+                            .tolist()
+                        )
+                        matrix_df = snapshot_df.pivot(
+                            index='Week Label',
+                            columns='Employee Full Name',
+                            values='Summary'
+                        ).reindex(week_order)
+                        ordered_cols = [emp for emp in selected_week_employees if emp in matrix_df.columns]
+                        ordered_cols += [col for col in matrix_df.columns if col not in set(ordered_cols)]
+                        matrix_df = matrix_df[ordered_cols]
+                        st.dataframe(matrix_df.fillna("-"), use_container_width=True)
+
+                        st.markdown("### Weekly Detailed Metrics")
+                        detail_cols = [
+                            'Week Label', 'Employee Full Name', 'Total Working Hours', 'Expected Hours',
+                            'Overtime Hours', 'Working Days', 'Late Days', 'Early Departure Days',
+                            'Anomaly Days', 'No Lunch Days', '8h+ No Lunch Days', 'Avg Meal / Day (min)'
+                        ]
+                        sort_cols = ['Total Working Hours']
+                        sort_ascending = [False]
+                        if 'Week Index' in weekly_comp_df.columns:
+                            sort_cols = ['Week Index', 'Total Working Hours']
+                            sort_ascending = [True, False]
+                        st.dataframe(
+                            weekly_comp_df.sort_values(
+                                sort_cols,
+                                ascending=sort_ascending
+                            )[detail_cols],
+                            use_container_width=True,
+                            height=420
+                        )
 
     # ------------------------------------------------------------------------
     # TAB 7: LUNCH RISK & BEHAVIOR ANALYSIS
@@ -5199,7 +5837,7 @@ def main():
                 selected_month_wp = st.session_state.wp_cal_month
 
                 kpi_data = get_work_pattern_kpis_cached(
-                    wp_source_df, selected_emp_wp, selected_year_wp, selected_month_wp
+                    wp_source_df, selected_emp_wp, selected_year_wp, selected_month_wp, annotation_items
                 )
                 st.markdown("### Calendar KPIs")
                 kpi_row1 = st.columns(3)
@@ -5247,13 +5885,13 @@ def main():
                     create_metric_card(
                         "High-Risk No-Lunch Days",
                         int(kpi_data.get('high_risk_no_lunch_days', 0)),
-                        help_text="Expected workdays only: Working Hours >= 8 and Meal Hours = 0."
+                        help_text="Expected workdays only: Working Hours >= 8 and Meal Hours = 0 (Friday included for this high-risk case)."
                     )
                 with kpi_row4[1]:
                     create_metric_card(
                         "No-Lunch Working Days",
                         int(kpi_data.get('no_lunch_working_days', 0)),
-                        help_text="Expected workdays only: any worked hours with Meal Hours = 0."
+                        help_text="Expected workdays only: Meal Hours = 0, excluding normal Fridays."
                     )
 
                 if kpi_data['worked_non_working_days'] > 0:
@@ -5284,11 +5922,6 @@ def main():
                         unsafe_allow_html=True
                     )
 
-                if "special_days" not in st.session_state:
-                    st.session_state.special_days = {}
-
-                special_days = st.session_state.special_days
-
                 with st.expander("Special Day Annotations", expanded=False):
                     add_col, list_col = st.columns([3, 2])
                     with add_col:
@@ -5314,7 +5947,7 @@ def main():
                         )
                         special_type = st.selectbox(
                             "Operational Note",
-                            ["Closed", "Open Late", "Early Close", "Special Hours"],
+                            list(ANNOTATION_TYPES),
                             key="wp_special_type"
                         )
                         special_reason = st.text_input(
@@ -5322,25 +5955,75 @@ def main():
                             key="wp_special_reason",
                             placeholder="e.g., Weather closure, Staff meeting"
                         )
+                        special_open_time = None
+                        special_close_time = None
+                        if special_type == "Special Hours":
+                            special_time_cols = st.columns(2)
+                            with special_time_cols[0]:
+                                special_open_time = st.time_input(
+                                    "Open Time",
+                                    value=Config.STANDARD_START_TIME,
+                                    key="wp_special_open_time"
+                                )
+                            with special_time_cols[1]:
+                                default_close_time = (
+                                    Config.EARLY_DEPARTURE_TIME_FRI
+                                    if special_date.weekday() == 4
+                                    else Config.EARLY_DEPARTURE_TIME_MON_THU
+                                )
+                                special_close_time = st.time_input(
+                                    "Close Time",
+                                    value=default_close_time,
+                                    key="wp_special_close_time"
+                                )
                         if st.button("Save Special Day", key="wp_special_save"):
-                            date_key = special_date.strftime("%Y-%m-%d")
-                            special_days[date_key] = {
-                                "type": special_type,
-                                "reason": special_reason.strip()
-                            }
-                            st.session_state.special_days = special_days
+                            payload_reason = special_reason.strip()
+                            if special_type == "Special Hours":
+                                if special_open_time is None or special_close_time is None:
+                                    st.error("Please provide both open and close times for Special Hours.")
+                                elif special_open_time >= special_close_time:
+                                    st.error("Close time must be later than open time for Special Hours.")
+                                else:
+                                    payload_reason = format_special_hours_reason(
+                                        special_open_time, special_close_time, payload_reason
+                                    )
+                                    if upsert_annotation(special_date, special_type, payload_reason):
+                                        st.success("Annotation saved.")
+                                        if hasattr(st, "rerun"):
+                                            st.rerun()
+                                        else:
+                                            st.experimental_rerun()
+                                    else:
+                                        st.error("Unable to save annotation. Please check database connection.")
+                            else:
+                                if upsert_annotation(special_date, special_type, payload_reason):
+                                    st.success("Annotation saved.")
+                                    if hasattr(st, "rerun"):
+                                        st.rerun()
+                                    else:
+                                        st.experimental_rerun()
+                                else:
+                                    st.error("Unable to save annotation. Please check database connection.")
                     with list_col:
                         month_items = []
-                        for date_key, meta in special_days.items():
+                        for date_key, ann_type, ann_reason in annotation_items:
                             try:
                                 dval = datetime.strptime(date_key, "%Y-%m-%d").date()
                             except (TypeError, ValueError):
                                 continue
                             if dval.year == selected_year_wp and dval.month == selected_month_wp:
+                                open_time, close_time, parsed_reason = parse_special_hours_reason(ann_reason)
+                                hours_window = ""
+                                display_reason = ann_reason
+                                if ann_type == "Special Hours":
+                                    if open_time and close_time:
+                                        hours_window = f"{open_time.strftime('%H:%M')} - {close_time.strftime('%H:%M')}"
+                                    display_reason = parsed_reason
                                 month_items.append({
                                     "Date": dval,
-                                    "Type": meta.get("type", ""),
-                                    "Reason": meta.get("reason", "")
+                                    "Type": ann_type,
+                                    "Hours": hours_window,
+                                    "Reason": display_reason
                                 })
                         month_items = sorted(month_items, key=lambda r: r["Date"])
                         if month_items:
@@ -5354,21 +6037,26 @@ def main():
                                 key="wp_special_remove_date"
                             )
                             if st.button("Remove", key="wp_special_remove_btn"):
-                                remove_key = remove_date.strftime("%Y-%m-%d")
-                                special_days.pop(remove_key, None)
-                                st.session_state.special_days = special_days
+                                if delete_annotation(remove_date):
+                                    st.success("Annotation removed.")
+                                    if hasattr(st, "rerun"):
+                                        st.rerun()
+                                    else:
+                                        st.experimental_rerun()
+                                else:
+                                    st.error("Unable to remove annotation. Please check database connection.")
                         else:
                             st.caption("No special days noted for this month.")
 
                 special_day_items = []
-                for date_key, meta in special_days.items():
+                for date_key, ann_type, ann_reason in annotation_items:
                     try:
                         dval = datetime.strptime(date_key, "%Y-%m-%d").date()
                     except (TypeError, ValueError):
                         continue
                     if dval.year == selected_year_wp and dval.month == selected_month_wp:
                         special_day_items.append(
-                            (date_key, meta.get("type", ""), meta.get("reason", ""))
+                            (date_key, ann_type, ann_reason)
                         )
                 special_day_items = tuple(sorted(special_day_items))
 
@@ -5399,7 +6087,7 @@ def main():
                 st.markdown("### Work Pattern Distribution")
                 
                 distribution_df = get_work_pattern_distribution_cached(
-                    wp_source_df, selected_emp_wp, selected_year_wp, selected_month_wp
+                    wp_source_df, selected_emp_wp, selected_year_wp, selected_month_wp, annotation_items
                 )
                 if len(distribution_df) > 0:
                     color_map = {

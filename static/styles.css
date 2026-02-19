@@ -1,0 +1,12 @@
+/* Shared production style hook.
+   Keep this file lightweight to avoid fighting tab-specific legacy styles. */
+
+:root {
+  --brand-primary: #2e86ab;
+  --text-default: #1f2933;
+}
+
+.app-shell-title {
+  color: var(--brand-primary);
+  font-weight: 700;
+}

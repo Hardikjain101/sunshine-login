@@ -1,11 +1,6 @@
 __pycache__/
-*.py[cod]
-
-# Streamlit secrets
-.streamlit/secrets.toml
-
-# Local cache marker
-.cache_version
-
-# Local data files
-attendance_data*.xlsx
+*.pyc
+.venv/
+venv/
+env/
+.env
