@@ -440,6 +440,59 @@ def authenticate_user(username: str, password: str) -> Tuple[bool, str, Optional
             conn.close()
 
 
+def _get_current_user_record() -> Optional[Dict[str, object]]:
+    """Fetch the active database record for the signed-in user."""
+    if not st.session_state.get("auth_authenticated"):
+        return None
+
+    auth_user_id = st.session_state.get("auth_user_id")
+    auth_user = (st.session_state.get("auth_user") or "").strip()
+    if not auth_user_id or not auth_user:
+        return None
+
+    conn = None
+    cursor = None
+    try:
+        conn = _get_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            f"""
+            SELECT id, username, role, is_active
+            FROM {USER_TABLE}
+            WHERE id = %s AND username = %s
+            """,
+            (auth_user_id, auth_user),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+
+        row["role"] = (row.get("role") or "employee").strip().lower()
+        row["is_active"] = int(row.get("is_active", 0) or 0)
+        if row["is_active"] != 1:
+            return None
+        return row
+    except Exception:
+        return None
+    finally:
+        if cursor is not None:
+            cursor.close()
+        if conn is not None:
+            conn.close()
+
+
+def _current_user_is_admin() -> bool:
+    """Require both session role and database role to be admin."""
+    session_role = (st.session_state.get("auth_role") or "").strip().lower()
+    if session_role != "admin":
+        return False
+
+    current_user = _get_current_user_record()
+    if not current_user:
+        return False
+    return current_user.get("role") == "admin"
+
+
 def get_allowed_employees(user_id: int) -> List[str]:
     """Fetch allowed employee names for a user."""
     conn = None
@@ -596,6 +649,38 @@ def _update_user_password(user_id: int, new_password: str) -> bool:
             conn.close()
 
 
+def _change_current_user_password(
+    current_password: str,
+    new_password: str,
+    confirm_password: str,
+) -> Tuple[bool, str]:
+    """Allow a signed-in user to change only their own password."""
+    current_user = _get_current_user_record()
+    if not current_user:
+        return False, "Unable to identify the current user."
+
+    if not current_password or not new_password or not confirm_password:
+        return False, "Current password, new password, and confirmation are required."
+    if new_password != confirm_password:
+        return False, "New password and confirmation do not match."
+
+    auth_ok, _, auth_row = authenticate_user(current_user["username"], current_password)
+    if not auth_ok or not auth_row:
+        return False, "Current password is incorrect."
+
+    try:
+        authenticated_user_id = int(auth_row.get("id"))
+        current_user_id = int(current_user.get("id"))
+    except (TypeError, ValueError):
+        return False, "Unable to verify the current user."
+
+    if authenticated_user_id != current_user_id:
+        return False, "Unable to verify the current user."
+    if not _update_user_password(current_user_id, new_password):
+        return False, "Database error while updating password."
+    return True, "Password updated successfully."
+
+
 def _filter_df_by_employees(df: pd.DataFrame, allowed: List[str]) -> pd.DataFrame:
     if df is None:
         return df
@@ -621,8 +706,33 @@ def _build_employee_filter_clause(allowed: List[str]) -> Tuple[str, Tuple]:
     return f"WHERE employee_name IN ({placeholders})", tuple(allowed)
 
 
+def render_account_security_panel() -> None:
+    """Self-service account security controls for the signed-in user."""
+    st.caption("Change your own password.")
+    with st.form("change_my_password_form", clear_on_submit=True):
+        current_password = st.text_input("Current Password", type="password")
+        new_password = st.text_input("New Password", type="password")
+        confirm_password = st.text_input("Confirm New Password", type="password")
+        submitted = st.form_submit_button("Change Password")
+
+    if submitted:
+        ok, message = _change_current_user_password(
+            current_password,
+            new_password,
+            confirm_password,
+        )
+        if ok:
+            st.success(message)
+        else:
+            st.error(message)
+
+
 def render_admin_panel() -> None:
     """Admin UI to create users and assign employee access."""
+    if not _current_user_is_admin():
+        st.info("Admin access required.")
+        return
+
     st.subheader("Admin Panel")
     st.markdown("Create users and assign employee access.")
 
@@ -685,69 +795,11 @@ def render_admin_panel() -> None:
                 conn.close()
 
     # =====================================
-    # ADMIN SELF PASSWORD CHANGE START
-    # =====================================
-    st.markdown("---")
-    st.subheader("Change My Password")
-
-    current_password = st.text_input(
-        "Current Password",
-        type="password",
-        key="admin_current_password",
-    )
-    new_password = st.text_input(
-        "New Password",
-        type="password",
-        key="admin_new_password",
-    )
-    confirm_password = st.text_input(
-        "Confirm New Password",
-        type="password",
-        key="admin_confirm_password",
-    )
-
-    if st.button("Update My Password", key="admin_update_password"):
-        auth_user = st.session_state.get("auth_user", "")
-        auth_user_id = st.session_state.get("auth_user_id")
-        if not auth_user_id:
-            st.error("Unable to identify current user.")
-        elif not current_password or not new_password:
-            st.error("Current and new passwords are required.")
-        elif new_password != confirm_password:
-            st.error("New password and confirmation do not match.")
-        else:
-            ok, _, _ = authenticate_user(auth_user, current_password)
-            if not ok:
-                st.error("Current password is incorrect.")
-            elif _update_user_password(auth_user_id, new_password):
-                st.success("Password updated successfully.")
-                for key in (
-                    "admin_current_password",
-                    "admin_new_password",
-                    "admin_confirm_password",
-                ):
-                    st.session_state.pop(key, None)
-                if hasattr(st, "rerun"):
-                    st.rerun()
-                else:
-                    st.experimental_rerun()
-            else:
-                st.error("Database error while updating password.")
-
-    # =====================================
-    # ADMIN SELF PASSWORD CHANGE END
-    # =====================================
-
-    # =====================================
     # ADMIN USER MANAGEMENT SECTION START
     # =====================================
     st.markdown("---")
     st.subheader("Manage Existing Users")
     st.caption("Update status, reset passwords, and modify employee access.")
-
-    if st.session_state.get("auth_role") != "admin":
-        st.info("Admin access required.")
-        return
 
     current_admin_id = st.session_state.get("auth_user_id")
     users = _fetch_all_users(exclude_user_id=current_admin_id)
@@ -2136,6 +2188,9 @@ def _reset_dashboard_data_state() -> Tuple[bool, str]:
     Clear loaded attendance state and return app to upload-ready condition.
     Keeps auth context so users remain signed in.
     """
+    if not _current_user_is_admin():
+        return False, "Admin access required to reset dashboard data."
+
     errors: List[str] = []
 
     _clear_all_caches()
@@ -4029,7 +4084,8 @@ def create_work_pattern_calendar(
     html = '<div class="cal-wrap">'
     html += """
         <style>
-        .cal-wrap{font-family:Arial,sans-serif;max-width:980px;margin:0 auto;padding:16px;background:linear-gradient(180deg,#f5f8fb 0%,#fff 60%);border:1px solid #dde6ef;border-radius:12px;box-shadow:0 6px 18px rgba(22,43,60,.08);}
+        html,body{margin:0;padding:0;height:auto;max-height:none;overflow:visible;}
+        .cal-wrap{font-family:Arial,sans-serif;max-width:980px;height:auto;max-height:none;overflow:visible;margin:0 auto 20px;padding:16px 16px 24px;box-sizing:border-box;background:linear-gradient(180deg,#f5f8fb 0%,#fff 60%);border:1px solid #dde6ef;border-radius:12px;box-shadow:0 6px 18px rgba(22,43,60,.08);}
         .cal-header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;}
         .cal-title{font-size:20px;font-weight:700;color:#1f5f7a;}
         .cal-subtitle{font-size:14px;font-weight:600;color:#4b5b66;}
@@ -4051,7 +4107,7 @@ def create_work_pattern_calendar(
         .insight-label{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:#5d6c79;}
         .insight-value{font-size:18px;font-weight:700;margin-top:4px;}
         .insight-sub,.insight-foot{font-size:12px;color:#5d6c79;margin-top:2px;}
-        .cal-table{width:100%;border-collapse:separate;border-spacing:6px;margin-top:14px;table-layout:fixed;}
+        .cal-table{width:100%;border-collapse:separate;border-spacing:6px;margin-top:14px;margin-bottom:8px;table-layout:fixed;}
         .cal-table th{background:#2E86AB;color:#fff;padding:8px;font-size:11px;letter-spacing:.06em;text-transform:uppercase;border-radius:8px;}
         .cell-body{display:flex;flex-direction:column;height:100%;padding-bottom:16px;}
         .day-top{display:flex;justify-content:space-between;align-items:center;gap:6px;min-height:18px;}
@@ -4085,7 +4141,7 @@ def create_work_pattern_calendar(
         .hours-fill.off{background:#2e86ab;}
         .hours-fill.zero{background:#c8d0d9;}
         .off-tag{position:absolute;top:6px;right:6px;font-size:9px;font-weight:700;padding:2px 5px;border-radius:6px;background:#fff;border:1px solid #607d8b;color:#42535e;}
-        .legend{margin-top:14px;padding:10px;background:#f7f9fb;border:1px solid #dde6ef;border-radius:10px;display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;}
+        .legend{height:auto;max-height:none;overflow:visible;margin-top:14px;margin-bottom:8px;padding:10px;background:#f7f9fb;border:1px solid #dde6ef;border-radius:10px;display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;}
         .legend-title{font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#5d6c79;margin-bottom:6px;}
         .legend-item{display:flex;align-items:center;gap:6px;font-size:12px;color:#1f2933;margin-bottom:4px;}
         .legend-swatch{width:14px;height:14px;border-radius:4px;border:1px solid #dde6ef;background:#fff;}
@@ -4570,6 +4626,8 @@ def main():
         auth_user = st.session_state.get("auth_user", "")
         auth_role = st.session_state.get("auth_role", "employee")
         st.caption(f"Signed in as {auth_user} ({auth_role})")
+        with st.expander("Account Settings", expanded=False):
+            render_account_security_panel()
         if st.button("Logout"):
             for key in ("auth_authenticated", "auth_user", "auth_user_id", "auth_role", "allowed_employees"):
                 st.session_state.pop(key, None)
@@ -4651,16 +4709,26 @@ def main():
     # FILE MANAGEMENT & PERSISTENCE
     st.sidebar.markdown("---")
     st.sidebar.subheader("\U0001F4CA Data Management")
-    if st.sidebar.button("RESET DATA", key="reset_data_btn", use_container_width=True):
-        reset_ok, reset_msg = _reset_dashboard_data_state()
-        if reset_ok:
-            st.sidebar.success(reset_msg)
-            if hasattr(st, "rerun"):
-                st.rerun()
+    is_admin_session = (st.session_state.get("auth_role") or "").strip().lower() == "admin"
+    if is_admin_session:
+        if st.sidebar.button("RESET DATA", key="reset_data_btn", use_container_width=True):
+            reset_ok, reset_msg = _reset_dashboard_data_state()
+            if reset_ok:
+                st.sidebar.success(reset_msg)
+                if hasattr(st, "rerun"):
+                    st.rerun()
+                else:
+                    st.experimental_rerun()
             else:
-                st.experimental_rerun()
-        else:
-            st.sidebar.error(reset_msg)
+                st.sidebar.error(reset_msg)
+    else:
+        st.sidebar.button(
+            "RESET DATA (Admin Only)",
+            key="reset_data_btn_disabled",
+            use_container_width=True,
+            disabled=True,
+        )
+        st.sidebar.caption("Only admin accounts can reset dashboard data.")
 
     uploaded_file = st.sidebar.file_uploader("Update Data Source", type=['xlsx', 'xls'], key="data_upload_source")
     
@@ -6081,7 +6149,9 @@ def main():
                     )
                     
                     # Use Streamlit's HTML component for proper rendering (not markdown)
-                    components.html(calendar_html, height=900, scrolling=False)
+                    calendar_row_count = len(calendar.Calendar(firstweekday=0).monthdayscalendar(selected_year_wp, selected_month_wp))
+                    calendar_height = 480 + (calendar_row_count * 120)
+                    components.html(calendar_html, height=calendar_height, scrolling=False)
                 
                 st.markdown("---")
                 st.markdown("### Work Pattern Distribution")
